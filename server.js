@@ -3,6 +3,7 @@ const express    = require('express');
 const cors       = require('cors');
 const crypto     = require('crypto');
 const webpush    = require('web-push');
+const { MercadoPagoConfig, Payment } = require('mercadopago');
 const { createClient } = require('@supabase/supabase-js');
 
 /* ── Web Push ──────────────────────────────────────────────── */
@@ -12,6 +13,11 @@ if (process.env.VAPID_PUBLIC_KEY && process.env.VAPID_PRIVATE_KEY) {
     process.env.VAPID_PUBLIC_KEY,
     process.env.VAPID_PRIVATE_KEY
   );
+}
+
+/* ── Mercado Pago ──────────────────────────────────────────── */
+function mpClient() {
+  return new MercadoPagoConfig({ accessToken: process.env.MP_ACCESS_TOKEN });
 }
 
 const app  = express();
@@ -54,6 +60,37 @@ function requireAdmin(req, res, next) {
   const token = req.headers['x-admin-token'];
   if (!validateToken(token)) return res.status(401).json({ error: 'Não autorizado' });
   next();
+}
+
+/* ── Push helper ───────────────────────────────────────────── */
+const STATUS_MSG = {
+  pago:       { title: '✅ Pagamento confirmado!', body: 'Seu açaí está na fila de preparo.' },
+  preparando: { title: '🍧 Preparando seu açaí!', body: 'Estamos fazendo com muito carinho!' },
+  pronto:     { title: '🎉 Pedido pronto!',        body: 'Seu açaí está pronto para retirada/entrega.' },
+  a_caminho:  { title: '🛵 A caminho!',            body: 'O motoboy saiu com seu açaí!' },
+  entregue:   { title: '🎊 Entregue!',             body: 'Bom apetite! Obrigada pela preferência 💜' },
+  cancelado:  { title: '❌ Pedido cancelado',      body: 'Entre em contato conosco se tiver dúvidas.' },
+};
+
+async function sendPushToUser(phone, status, orderId) {
+  if (!STATUS_MSG[status] || !phone) return;
+  const supabase = db();
+  const { data: subs } = await supabase
+    .from('push_subscriptions')
+    .select('subscription')
+    .eq('user_id', phone);
+  if (!subs?.length) return;
+  const { title, body } = STATUS_MSG[status];
+  const payload = JSON.stringify({ title, body, orderId });
+  for (const row of subs) {
+    try {
+      await webpush.sendNotification(row.subscription, payload);
+    } catch (e) {
+      if (e.statusCode === 410) {
+        await supabase.from('push_subscriptions').delete().eq('user_id', phone);
+      }
+    }
+  }
 }
 
 /* ════════════════════════════════════════════════════════════
@@ -117,10 +154,38 @@ app.put('/api/products', requireAdmin, async (req, res) => {
    PEDIDOS
 ════════════════════════════════════════════════════════════ */
 app.post('/api/orders', async (req, res) => {
-  const { customerName, customerPhone, productName, summary, deliveryMethod, total, pixCode } = req.body;
+  const { customerName, customerPhone, productName, summary, deliveryMethod, total } = req.body;
 
   if (!customerName || !customerPhone || !productName || !deliveryMethod)
     return res.status(400).json({ error: 'Dados incompletos' });
+
+  /* ── Gera PIX real via Mercado Pago ── */
+  let pixCode = null;
+  let mpPaymentId = null;
+
+  if (process.env.MP_ACCESS_TOKEN) {
+    try {
+      const payment = new Payment(mpClient());
+      const result  = await payment.create({
+        body: {
+          transaction_amount: Number(total),
+          description:        `Açaí Trufado - ${productName}`,
+          payment_method_id:  'pix',
+          payer: {
+            email:        'cliente@acaitrufado.com',
+            first_name:   customerName.split(' ')[0],
+            last_name:    customerName.split(' ').slice(1).join(' ') || 'Cliente',
+            identification: { type: 'CPF', number: '00000000000' },
+          },
+        },
+        requestOptions: { idempotencyKey: `${customerPhone}-${Date.now()}` },
+      });
+      pixCode     = result.point_of_interaction?.transaction_data?.qr_code ?? null;
+      mpPaymentId = String(result.id ?? '');
+    } catch (e) {
+      console.error('MP PIX error:', e?.message ?? e);
+    }
+  }
 
   const { data, error } = await db()
     .from('orders')
@@ -131,14 +196,15 @@ app.post('/api/orders', async (req, res) => {
       summary:         summary ?? [],
       delivery_method: deliveryMethod,
       total:           total ?? 0,
-      pix_code:        pixCode ?? null,
+      pix_code:        pixCode,
+      mp_payment_id:   mpPaymentId,
       status:          'aguardando_pix',
     })
     .select()
     .single();
 
   if (error) return res.status(500).json({ error: error.message });
-  res.status(201).json(data);
+  res.status(201).json({ ...data, pixCode });
 });
 
 app.get('/api/orders', requireAdmin, async (req, res) => {
@@ -173,39 +239,62 @@ app.patch('/api/orders/:id/status', requireAdmin, async (req, res) => {
 
   if (error) return res.status(500).json({ error: error.message });
 
-  /* ── Envia push para o cliente ── */
-  const STATUS_MSG = {
-    pago:           { title: '✅ Pagamento confirmado!', body: 'Seu açaí está na fila de preparo.' },
-    preparando:     { title: '🍧 Preparando seu açaí!', body: 'Estamos fazendo com muito carinho!' },
-    pronto:         { title: '🎉 Pedido pronto!', body: 'Seu açaí está pronto para retirada/entrega.' },
-    a_caminho:      { title: '🛵 A caminho!', body: 'O motoboy saiu com seu açaí!' },
-    entregue:       { title: '🎊 Entregue!', body: 'Bom apetite! Obrigada pela preferência 💜' },
-    cancelado:      { title: '❌ Pedido cancelado', body: 'Entre em contato conosco se tiver dúvidas.' },
-  };
-
-  if (STATUS_MSG[status] && data?.customer_phone) {
-    const supabase = db();
-    const { data: subs } = await supabase
-      .from('push_subscriptions')
-      .select('subscription')
-      .eq('user_id', data.customer_phone);
-
-    if (subs?.length) {
-      const { title, body } = STATUS_MSG[status];
-      const payload = JSON.stringify({ title, body, orderId: id });
-      for (const row of subs) {
-        try {
-          await webpush.sendNotification(row.subscription, payload);
-        } catch (e) {
-          if (e.statusCode === 410) {
-            await supabase.from('push_subscriptions').delete().eq('user_id', data.customer_phone);
-          }
-        }
-      }
-    }
-  }
+  await sendPushToUser(data?.customer_phone, status, id);
 
   res.json(data);
+});
+
+app.get('/api/orders/active/:userId', async (req, res) => {
+  const { userId } = req.params;
+  const { data, error } = await db()
+    .from('orders')
+    .select('*')
+    .eq('customer_phone', userId)
+    .not('status', 'in', '("entregue","cancelado")')
+    .order('created_at', { ascending: false })
+    .limit(1);
+
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data?.[0] ?? null);
+});
+
+/* ════════════════════════════════════════════════════════════
+   WEBHOOK MERCADO PAGO
+════════════════════════════════════════════════════════════ */
+app.post('/api/webhook/mercadopago', async (req, res) => {
+  res.sendStatus(200);
+
+  const { type, data } = req.body;
+  if (type !== 'payment' || !data?.id) return;
+
+  try {
+    const payment = new Payment(mpClient());
+    const info    = await payment.get({ id: data.id });
+
+    if (info.status !== 'approved') return;
+
+    const supabase   = db();
+    const paymentId  = String(info.id);
+
+    const { data: orders } = await supabase
+      .from('orders')
+      .select('id, customer_phone')
+      .eq('mp_payment_id', paymentId)
+      .limit(1);
+
+    if (!orders?.length) return;
+
+    const order = orders[0];
+
+    await supabase
+      .from('orders')
+      .update({ status: 'pago' })
+      .eq('id', order.id);
+
+    await sendPushToUser(order.customer_phone, 'pago', order.id);
+  } catch (e) {
+    console.error('Webhook MP error:', e?.message ?? e);
+  }
 });
 
 /* ════════════════════════════════════════════════════════════
@@ -224,20 +313,6 @@ app.post('/api/push/subscribe', async (req, res) => {
 
 app.get('/api/push/vapid-public-key', (_, res) => {
   res.json({ key: process.env.VAPID_PUBLIC_KEY ?? '' });
-});
-
-app.get('/api/orders/active/:userId', async (req, res) => {
-  const { userId } = req.params;
-  const { data, error } = await db()
-    .from('orders')
-    .select('*')
-    .eq('customer_phone', userId)
-    .not('status', 'in', '("entregue","cancelado")')
-    .order('created_at', { ascending: false })
-    .limit(1);
-
-  if (error) return res.status(500).json({ error: error.message });
-  res.json(data?.[0] ?? null);
 });
 
 /* ── Health check ──────────────────────────────────────────── */
