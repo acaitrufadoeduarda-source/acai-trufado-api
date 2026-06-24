@@ -1,0 +1,184 @@
+require('dotenv').config();
+const express    = require('express');
+const cors       = require('cors');
+const crypto     = require('crypto');
+const { createClient } = require('@supabase/supabase-js');
+
+const app  = express();
+const PORT = process.env.PORT || 3000;
+
+/* ── Supabase ──────────────────────────────────────────────── */
+function db() {
+  return createClient(
+    process.env.SUPABASE_URL,
+    process.env.SUPABASE_SERVICE_ROLE_KEY
+  );
+}
+
+/* ── Middleware ────────────────────────────────────────────── */
+app.use(cors());
+app.use(express.json({ limit: '10mb' }));
+
+/* ── Auth helpers ──────────────────────────────────────────── */
+function generateToken() {
+  const secret    = process.env.ADMIN_PASSWORD + '_acai_secret';
+  const expiresAt = Math.floor(Date.now() / 1000) + 60 * 60 * 12;
+  const hash      = crypto.createHmac('sha256', secret).update(String(expiresAt)).digest('hex');
+  return `${hash}.${expiresAt}`;
+}
+
+function validateToken(token) {
+  if (!token) return false;
+  try {
+    const [hash, expiresAt] = token.split('.');
+    if (!hash || !expiresAt) return false;
+    if (parseInt(expiresAt) < Math.floor(Date.now() / 1000)) return false;
+    const secret   = process.env.ADMIN_PASSWORD + '_acai_secret';
+    const expected = crypto.createHmac('sha256', secret).update(expiresAt).digest('hex');
+    return hash === expected;
+  } catch { return false; }
+}
+
+function requireAdmin(req, res, next) {
+  const token = req.headers['x-admin-token'];
+  if (!validateToken(token)) return res.status(401).json({ error: 'Não autorizado' });
+  next();
+}
+
+/* ════════════════════════════════════════════════════════════
+   AUTH
+════════════════════════════════════════════════════════════ */
+app.post('/api/auth', async (req, res) => {
+  const { email, password } = req.body;
+  const adminEmail    = process.env.ADMIN_EMAIL;
+  const adminPassword = process.env.ADMIN_PASSWORD;
+
+  if (!adminEmail || !adminPassword)
+    return res.status(500).json({ error: 'Servidor não configurado' });
+
+  const emailOk    = email?.toLowerCase().trim() === adminEmail.toLowerCase().trim();
+  const passwordOk = password === adminPassword;
+
+  if (!emailOk || !passwordOk) {
+    await new Promise(r => setTimeout(r, 400));
+    return res.status(401).json({ error: 'Credenciais inválidas' });
+  }
+
+  res.json({ token: generateToken() });
+});
+
+/* ════════════════════════════════════════════════════════════
+   PRODUTOS
+════════════════════════════════════════════════════════════ */
+app.get('/api/products', async (req, res) => {
+  const { data, error } = await db()
+    .from('products')
+    .select('*')
+    .eq('active', true)
+    .order('created_at', { ascending: true });
+
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data ?? []);
+});
+
+app.put('/api/products', requireAdmin, async (req, res) => {
+  const products = req.body;
+  const supabase = db();
+
+  await supabase.from('products').delete().neq('id', '00000000-0000-0000-0000-000000000000');
+
+  if (!products.length) return res.json({ ok: true });
+
+  const rows = products.map(p => ({
+    name:         p.name,
+    description:  p.description ?? p.desc ?? '',
+    image_base64: p.imageBase64 ?? null,
+    active:       p.active ?? true,
+    groups:       p.groups ?? [],
+  }));
+
+  const { error } = await supabase.from('products').insert(rows);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ ok: true });
+});
+
+/* ════════════════════════════════════════════════════════════
+   PEDIDOS
+════════════════════════════════════════════════════════════ */
+app.post('/api/orders', async (req, res) => {
+  const { customerName, customerPhone, productName, summary, deliveryMethod, total, pixCode } = req.body;
+
+  if (!customerName || !customerPhone || !productName || !deliveryMethod)
+    return res.status(400).json({ error: 'Dados incompletos' });
+
+  const { data, error } = await db()
+    .from('orders')
+    .insert({
+      customer_name:   customerName,
+      customer_phone:  customerPhone,
+      product_name:    productName,
+      summary:         summary ?? [],
+      delivery_method: deliveryMethod,
+      total:           total ?? 0,
+      pix_code:        pixCode ?? null,
+      status:          'aguardando_pix',
+    })
+    .select()
+    .single();
+
+  if (error) return res.status(500).json({ error: error.message });
+  res.status(201).json(data);
+});
+
+app.get('/api/orders', requireAdmin, async (req, res) => {
+  const { data, error } = await db()
+    .from('orders')
+    .select('*')
+    .not('status', 'in', '("concluido","cancelado")')
+    .order('created_at', { ascending: false });
+
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+app.patch('/api/orders/:id/status', requireAdmin, async (req, res) => {
+  const { id } = req.params;
+  const { status, motoboy_lat, motoboy_lng } = req.body;
+
+  const VALID = ['pendente','pago','preparando','pronto','a_caminho','entregue','cancelado','aguardando_pix'];
+  if (!VALID.includes(status))
+    return res.status(400).json({ error: 'Status inválido' });
+
+  const update = { status };
+  if (motoboy_lat != null) update.motoboy_lat = motoboy_lat;
+  if (motoboy_lng != null) update.motoboy_lng = motoboy_lng;
+
+  const { data, error } = await db()
+    .from('orders')
+    .update(update)
+    .eq('id', id)
+    .select()
+    .single();
+
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+app.get('/api/orders/active/:userId', async (req, res) => {
+  const { userId } = req.params;
+  const { data, error } = await db()
+    .from('orders')
+    .select('*')
+    .eq('customer_phone', userId)
+    .not('status', 'in', '("entregue","cancelado")')
+    .order('created_at', { ascending: false })
+    .limit(1);
+
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data?.[0] ?? null);
+});
+
+/* ── Health check ──────────────────────────────────────────── */
+app.get('/health', (_, res) => res.json({ ok: true }));
+
+app.listen(PORT, () => console.log(`Servidor rodando na porta ${PORT}`));
