@@ -244,6 +244,16 @@ app.patch('/api/orders/:id/status', requireAdmin, async (req, res) => {
   res.json(data);
 });
 
+app.get('/api/orders/:id', async (req, res) => {
+  const { data, error } = await db()
+    .from('orders')
+    .select('*')
+    .eq('id', req.params.id)
+    .single();
+  if (error) return res.status(404).json({ error: 'Pedido não encontrado' });
+  res.json(data);
+});
+
 app.get('/api/orders/active/:userId', async (req, res) => {
   const { userId } = req.params;
   const { data, error } = await db()
