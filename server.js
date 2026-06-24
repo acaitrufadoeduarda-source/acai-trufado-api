@@ -16,7 +16,8 @@ function db() {
 }
 
 /* ── Middleware ────────────────────────────────────────────── */
-app.use(cors());
+app.use(cors({ origin: '*' }));
+app.options('*', cors({ origin: '*' }));
 app.use(express.json({ limit: '10mb' }));
 
 /* ── Auth helpers ──────────────────────────────────────────── */
