@@ -2,7 +2,17 @@ require('dotenv').config();
 const express    = require('express');
 const cors       = require('cors');
 const crypto     = require('crypto');
+const webpush    = require('web-push');
 const { createClient } = require('@supabase/supabase-js');
+
+/* ── Web Push ──────────────────────────────────────────────── */
+if (process.env.VAPID_PUBLIC_KEY && process.env.VAPID_PRIVATE_KEY) {
+  webpush.setVapidDetails(
+    process.env.VAPID_EMAIL || 'mailto:acaitrufadoeduarda@gmail.com',
+    process.env.VAPID_PUBLIC_KEY,
+    process.env.VAPID_PRIVATE_KEY
+  );
+}
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -162,7 +172,58 @@ app.patch('/api/orders/:id/status', requireAdmin, async (req, res) => {
     .single();
 
   if (error) return res.status(500).json({ error: error.message });
+
+  /* ── Envia push para o cliente ── */
+  const STATUS_MSG = {
+    pago:           { title: '✅ Pagamento confirmado!', body: 'Seu açaí está na fila de preparo.' },
+    preparando:     { title: '🍧 Preparando seu açaí!', body: 'Estamos fazendo com muito carinho!' },
+    pronto:         { title: '🎉 Pedido pronto!', body: 'Seu açaí está pronto para retirada/entrega.' },
+    a_caminho:      { title: '🛵 A caminho!', body: 'O motoboy saiu com seu açaí!' },
+    entregue:       { title: '🎊 Entregue!', body: 'Bom apetite! Obrigada pela preferência 💜' },
+    cancelado:      { title: '❌ Pedido cancelado', body: 'Entre em contato conosco se tiver dúvidas.' },
+  };
+
+  if (STATUS_MSG[status] && data?.customer_phone) {
+    const supabase = db();
+    const { data: subs } = await supabase
+      .from('push_subscriptions')
+      .select('subscription')
+      .eq('user_id', data.customer_phone);
+
+    if (subs?.length) {
+      const { title, body } = STATUS_MSG[status];
+      const payload = JSON.stringify({ title, body, orderId: id });
+      for (const row of subs) {
+        try {
+          await webpush.sendNotification(row.subscription, payload);
+        } catch (e) {
+          if (e.statusCode === 410) {
+            await supabase.from('push_subscriptions').delete().eq('user_id', data.customer_phone);
+          }
+        }
+      }
+    }
+  }
+
   res.json(data);
+});
+
+/* ════════════════════════════════════════════════════════════
+   PUSH SUBSCRIPTIONS
+════════════════════════════════════════════════════════════ */
+app.post('/api/push/subscribe', async (req, res) => {
+  const { userId, subscription } = req.body;
+  if (!userId || !subscription) return res.status(400).json({ error: 'Dados incompletos' });
+
+  const supabase = db();
+  await supabase.from('push_subscriptions').delete().eq('user_id', userId);
+  const { error } = await supabase.from('push_subscriptions').insert({ user_id: userId, subscription });
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ ok: true });
+});
+
+app.get('/api/push/vapid-public-key', (_, res) => {
+  res.json({ key: process.env.VAPID_PUBLIC_KEY ?? '' });
 });
 
 app.get('/api/orders/active/:userId', async (req, res) => {
