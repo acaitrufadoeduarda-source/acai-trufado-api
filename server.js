@@ -217,7 +217,10 @@ app.post('/api/orders', async (req, res) => {
     .select()
     .single();
 
-  if (error) return res.status(500).json({ error: error.message });
+  if (error) {
+    console.error('❌ Supabase insert error:', JSON.stringify(error));
+    return res.status(500).json({ error: error.message });
+  }
   res.status(201).json({ ...data, pixCode });
 });
 
