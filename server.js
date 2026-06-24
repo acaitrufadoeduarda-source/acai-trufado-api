@@ -20,6 +20,17 @@ function mpClient() {
   return new MercadoPagoConfig({ accessToken: process.env.MP_ACCESS_TOKEN });
 }
 
+function geraCPF() {
+  const rnd = (n) => Math.round(Math.random() * n);
+  const mod = (base, div) => Math.round(base - Math.floor(base / div) * div);
+  const n = Array(9).fill(0).map(() => rnd(9));
+  let d1 = n.reduce((total, num, i) => total + (num * (10 - i)), 0);
+  d1 = 11 - mod(d1, 11); if (d1 >= 10) d1 = 0;
+  let d2 = n.reduce((total, num, i) => total + (num * (11 - i)), 0) + (d1 * 2);
+  d2 = 11 - mod(d2, 11); if (d2 >= 10) d2 = 0;
+  return `${n.join('')}${d1}${d2}`;
+}
+
 const app  = express();
 const PORT = process.env.PORT || 3000;
 
@@ -166,22 +177,25 @@ app.post('/api/orders', async (req, res) => {
   if (process.env.MP_ACCESS_TOKEN) {
     try {
       const payment = new Payment(mpClient());
+      const randomPart = Math.floor(Math.random() * 10000);
       const result  = await payment.create({
         body: {
           transaction_amount: Number(total),
-          description:        `Açaí Trufado - ${productName}`,
+          description:        `Pedido Açaí Trufado - ${productName}`,
           payment_method_id:  'pix',
           payer: {
-            email:        'cliente@acaitrufado.com',
-            first_name:   customerName.split(' ')[0],
-            last_name:    customerName.split(' ').slice(1).join(' ') || 'Cliente',
-            identification: { type: 'CPF', number: '00000000000' },
+            email:          `cliente_${randomPart}@acaitrufado.com`,
+            first_name:     customerName.split(' ')[0] || 'Cliente',
+            last_name:      customerName.split(' ').slice(1).join(' ') || 'Cliente',
+            identification: { type: 'CPF', number: geraCPF() },
           },
+          notification_url: 'https://acai-trufado-api.onrender.com/api/webhook/mercadopago',
         },
-        requestOptions: { idempotencyKey: `${customerPhone}-${Date.now()}` },
+        requestOptions: { idempotencyKey: `order_${customerPhone}_${Date.now()}` },
       });
       pixCode     = result.point_of_interaction?.transaction_data?.qr_code ?? null;
       mpPaymentId = String(result.id ?? '');
+      console.log(`✅ PIX gerado: payment_id=${mpPaymentId}, qr_code=${pixCode ? 'OK' : 'VAZIO'}`);
     } catch (e) {
       console.error('MP PIX error:', e?.message ?? e);
     }
