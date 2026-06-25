@@ -58,7 +58,7 @@ const corsOptions = {
 };
 app.use(cors(corsOptions));
 app.options('*', cors(corsOptions));
-app.use(express.json({ limit: '10mb' }));
+app.use(express.json({ limit: '25mb' }));
 
 /* ── Rate limiting ─────────────────────────────────────────── */
 // Brute-force na senha: 5 tentativas / 15 min por IP
