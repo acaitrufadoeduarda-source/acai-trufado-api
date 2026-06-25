@@ -235,6 +235,19 @@ app.get('/api/orders', requireAdmin, async (req, res) => {
   res.json(data);
 });
 
+// Histórico — pedidos concluídos/cancelados (fonte de verdade: Supabase)
+app.get('/api/orders/history', requireAdmin, async (req, res) => {
+  const { data, error } = await db()
+    .from('orders')
+    .select('*')
+    .in('status', ['concluido', 'cancelado'])
+    .order('created_at', { ascending: false })
+    .limit(200);
+
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
 // Relatório — TODOS os pedidos (inclui concluído/cancelado), filtrado por data
 app.get('/api/orders/report', requireAdmin, async (req, res) => {
   const { from, to } = req.query;
