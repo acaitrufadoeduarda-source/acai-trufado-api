@@ -342,6 +342,40 @@ app.get('/api/push/vapid-public-key', (_, res) => {
   res.json({ key: process.env.VAPID_PUBLIC_KEY ?? '' });
 });
 
+/* ════════════════════════════════════════════════════════════
+   CONFIGURAÇÕES DA LOJA (open/closed/auto)
+════════════════════════════════════════════════════════════ */
+
+// Lê config — público (cliente usa para saber se loja está aberta)
+app.get('/api/settings', async (req, res) => {
+  try {
+    const supabase = db();
+    const { data, error } = await supabase
+      .from('store_settings')
+      .select('value')
+      .eq('key', 'loja_config')
+      .single();
+    if (error && error.code !== 'PGRST116') throw error;
+    res.json(data?.value ?? { modo: 'fechado', dias: [], horaIni: '14:00', horaFim: '22:00' });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Salva config — só admin
+app.put('/api/settings', requireAdmin, async (req, res) => {
+  try {
+    const supabase = db();
+    const { error } = await supabase
+      .from('store_settings')
+      .upsert({ key: 'loja_config', value: req.body }, { onConflict: 'key' });
+    if (error) throw error;
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 /* ── Health check ──────────────────────────────────────────── */
 app.get('/health', (_, res) => res.json({ ok: true }));
 
