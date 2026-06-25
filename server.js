@@ -151,6 +151,7 @@ app.put('/api/products', requireAdmin, async (req, res) => {
   const rows = products.map(p => ({
     name:         p.name,
     description:  p.description ?? p.desc ?? '',
+    price:        p.price ?? 0,
     image_base64: p.imageBase64 ?? null,
     active:       p.active ?? true,
     groups:       p.groups ?? [],
