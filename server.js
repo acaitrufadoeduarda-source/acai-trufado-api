@@ -344,7 +344,22 @@ app.get('/api/push/vapid-public-key', (_, res) => {
 
 /* ════════════════════════════════════════════════════════════
    CONFIGURAÇÕES DA LOJA (open/closed/auto)
+   — fallback em memória se tabela ainda não existir no Supabase
 ════════════════════════════════════════════════════════════ */
+let settingsMemory = { modo: 'fechado', dias: [], horaIni: '14:00', horaFim: '22:00' };
+
+// Tenta carregar do Supabase na inicialização
+(async () => {
+  try {
+    const supabase = db();
+    const { data } = await supabase
+      .from('store_settings')
+      .select('value')
+      .eq('key', 'loja_config')
+      .single();
+    if (data?.value) settingsMemory = data.value;
+  } catch { /* tabela ainda não existe — usa memória */ }
+})();
 
 // Lê config — público (cliente usa para saber se loja está aberta)
 app.get('/api/settings', async (req, res) => {
@@ -355,25 +370,32 @@ app.get('/api/settings', async (req, res) => {
       .select('value')
       .eq('key', 'loja_config')
       .single();
-    if (error && error.code !== 'PGRST116') throw error;
-    res.json(data?.value ?? { modo: 'fechado', dias: [], horaIni: '14:00', horaFim: '22:00' });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
+    // PGRST116 = linha não encontrada; qualquer outro erro = tabela não existe
+    if (!error) {
+      settingsMemory = data.value;
+      return res.json(data.value);
+    }
+  } catch { /* sem tabela, cai no fallback */ }
+  res.json(settingsMemory);
 });
 
 // Salva config — só admin
 app.put('/api/settings', requireAdmin, async (req, res) => {
+  // sempre salva em memória imediatamente
+  settingsMemory = req.body;
   try {
     const supabase = db();
     const { error } = await supabase
       .from('store_settings')
       .upsert({ key: 'loja_config', value: req.body }, { onConflict: 'key' });
-    if (error) throw error;
-    res.json({ ok: true });
+    if (error) {
+      // Tabela não existe — retorna 200 mesmo assim (memória já foi salva)
+      console.warn('store_settings não existe no Supabase:', error.message);
+    }
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    console.warn('Erro ao salvar settings no Supabase:', e.message);
   }
+  res.json({ ok: true });
 });
 
 /* ── Health check ──────────────────────────────────────────── */
