@@ -144,21 +144,49 @@ app.put('/api/products', requireAdmin, async (req, res) => {
   const products = req.body;
   const supabase = db();
 
-  await supabase.from('products').delete().neq('id', '00000000-0000-0000-0000-000000000000');
+  // Lista vazia: limpa tudo (intencional)
+  if (!products.length) {
+    await supabase.from('products').delete().neq('id', '00000000-0000-0000-0000-000000000000');
+    return res.json({ ok: true });
+  }
 
-  if (!products.length) return res.json({ ok: true });
+  function montaRows(comPrice) {
+    return products.map(p => {
+      const row = {
+        name:         p.name,
+        description:  p.description ?? p.desc ?? '',
+        image_base64: p.imageBase64 ?? null,
+        active:       p.active ?? true,
+        groups:       p.groups ?? [],
+      };
+      if (comPrice) row.price = p.price ?? 0;
+      return row;
+    });
+  }
 
-  const rows = products.map(p => ({
-    name:         p.name,
-    description:  p.description ?? p.desc ?? '',
-    price:        p.price ?? 0,
-    image_base64: p.imageBase64 ?? null,
-    active:       p.active ?? true,
-    groups:       p.groups ?? [],
-  }));
+  // 1) Guarda os ids atuais para apagar SÓ depois que a inserção der certo
+  const { data: existing } = await supabase.from('products').select('id');
 
-  const { error } = await supabase.from('products').insert(rows);
-  if (error) return res.status(500).json({ error: error.message });
+  // 2) Insere os novos PRIMEIRO (não destrói nada ainda)
+  let { error } = await supabase.from('products').insert(montaRows(true));
+
+  // Se falhar por causa da coluna price (ainda não criada), tenta sem ela
+  if (error && /price/i.test(error.message || '')) {
+    console.warn('Coluna price ausente — inserindo sem price:', error.message);
+    ({ error } = await supabase.from('products').insert(montaRows(false)));
+  }
+
+  // 3) Se ainda assim falhou, ABORTA sem apagar nada (dados preservados)
+  if (error) {
+    console.error('Insert de produtos falhou — preservando os existentes:', error.message);
+    return res.status(500).json({ error: error.message });
+  }
+
+  // 4) Inserção OK → agora sim apaga os antigos
+  if (existing?.length) {
+    await supabase.from('products').delete().in('id', existing.map(e => e.id));
+  }
+
   res.json({ ok: true });
 });
 
