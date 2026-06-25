@@ -235,6 +235,22 @@ app.get('/api/orders', requireAdmin, async (req, res) => {
   res.json(data);
 });
 
+// Relatório — TODOS os pedidos (inclui concluído/cancelado), filtrado por data
+app.get('/api/orders/report', requireAdmin, async (req, res) => {
+  const { from, to } = req.query;
+  let query = db()
+    .from('orders')
+    .select('id, product_name, summary, total, status, created_at, delivery_method')
+    .order('created_at', { ascending: false });
+
+  if (from) query = query.gte('created_at', from);
+  if (to)   query = query.lte('created_at', to);
+
+  const { data, error } = await query;
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
 app.patch('/api/orders/:id/status', requireAdmin, async (req, res) => {
   const { id } = req.params;
   const { status, motoboy_lat, motoboy_lng } = req.body;
