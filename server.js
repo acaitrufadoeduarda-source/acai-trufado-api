@@ -2,6 +2,7 @@ require('dotenv').config();
 const express    = require('express');
 const cors       = require('cors');
 const crypto     = require('crypto');
+const rateLimit  = require('express-rate-limit');
 const webpush    = require('web-push');
 const { MercadoPagoConfig, Payment } = require('mercadopago');
 const { createClient } = require('@supabase/supabase-js');
@@ -43,9 +44,30 @@ function db() {
 }
 
 /* ── Middleware ────────────────────────────────────────────── */
-app.use(cors({ origin: '*' }));
-app.options('*', cors({ origin: '*' }));
+app.set('trust proxy', 1); // Render fica atrás de proxy (necessário p/ rate-limit por IP)
+
+// CORS — aceita só os domínios oficiais (e requisições sem Origin: webhook, curl, server-to-server)
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS
+  ? process.env.ALLOWED_ORIGINS.split(',').map(s => s.trim())
+  : ['https://public-eta-eight-82.vercel.app']);
+const corsOptions = {
+  origin: (origin, cb) => {
+    if (!origin || ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+    return cb(new Error('Origem não permitida pelo CORS'));
+  },
+};
+app.use(cors(corsOptions));
+app.options('*', cors(corsOptions));
 app.use(express.json({ limit: '10mb' }));
+
+/* ── Rate limiting ─────────────────────────────────────────── */
+// Brute-force na senha: 5 tentativas / 15 min por IP
+const authLimiter  = rateLimit({ windowMs: 15 * 60 * 1000, max: 5,   standardHeaders: true, legacyHeaders: false, message: { error: 'Muitas tentativas de login. Aguarde alguns minutos.' } });
+// Flood de pedidos: 10 pedidos / 10 min por IP
+const orderLimiter = rateLimit({ windowMs: 10 * 60 * 1000, max: 10,  standardHeaders: true, legacyHeaders: false, message: { error: 'Muitos pedidos em sequência. Aguarde um pouco.' } });
+// Limite geral de respiro: 120 req / min por IP
+const apiLimiter   = rateLimit({ windowMs: 60 * 1000,      max: 120, standardHeaders: true, legacyHeaders: false });
+app.use('/api', apiLimiter);
 
 /* ── Auth helpers ──────────────────────────────────────────── */
 function generateToken() {
@@ -107,7 +129,7 @@ async function sendPushToUser(phone, status, orderId) {
 /* ════════════════════════════════════════════════════════════
    AUTH
 ════════════════════════════════════════════════════════════ */
-app.post('/api/auth', async (req, res) => {
+app.post('/api/auth', authLimiter, async (req, res) => {
   const { email, password } = req.body;
   const adminEmail    = process.env.ADMIN_EMAIL;
   const adminPassword = process.env.ADMIN_PASSWORD;
@@ -193,13 +215,50 @@ app.put('/api/products', requireAdmin, async (req, res) => {
 /* ════════════════════════════════════════════════════════════
    PEDIDOS
 ════════════════════════════════════════════════════════════ */
-app.post('/api/orders', async (req, res) => {
-  const { customerName, customerPhone, productName, summary, deliveryMethod, total } = req.body;
+app.post('/api/orders', orderLimiter, async (req, res) => {
+  const { customerName, customerPhone, productId, productName, summary, deliveryMethod } = req.body;
 
-  if (!customerName || !customerPhone || !productName || !deliveryMethod)
+  if (!customerName || !customerPhone || !deliveryMethod)
     return res.status(400).json({ error: 'Dados incompletos' });
 
-  /* ── Gera PIX real via Mercado Pago ── */
+  // Sanitização básica dos campos livres
+  const nome  = String(customerName).trim().slice(0, 80);
+  const fone  = String(customerPhone).replace(/\D/g, '').slice(0, 15);
+  if (!nome || fone.length < 10) return res.status(400).json({ error: 'Nome ou telefone inválido' });
+
+  /* ── Busca o produto REAL no banco e RECALCULA o total no servidor ──
+     Nunca confiamos no "total" enviado pelo cliente (evita manipulação de preço). */
+  const supabase = db();
+  let prod = null;
+  if (productId) {
+    ({ data: prod } = await supabase.from('products').select('name, price, groups, active').eq('id', productId).single());
+  }
+  // Fallback por nome (compatibilidade com clientes antigos)
+  if (!prod && productName) {
+    ({ data: prod } = await supabase.from('products').select('name, price, groups, active').eq('name', productName).limit(1).single());
+  }
+  if (!prod || prod.active === false)
+    return res.status(400).json({ error: 'Produto indisponível' });
+
+  let total = Number(prod.price) || 0;
+  const summarySeguro = [];
+  for (const g of (Array.isArray(summary) ? summary : [])) {
+    const grupoReal = (prod.groups || []).find(x => x.name === g.groupName);
+    if (!grupoReal) continue;
+    const opcoes = [];
+    for (const o of (g.options || [])) {
+      const optReal = (grupoReal.options || []).find(x => x.name === o.name);
+      if (!optReal) continue; // ignora opções inexistentes
+      const qty = Math.max(1, Math.min(99, parseInt(o.qty) || 1));
+      total += (Number(optReal.price) || 0) * qty;
+      opcoes.push({ name: optReal.name, qty, price: Number(optReal.price) || 0 });
+    }
+    if (opcoes.length) summarySeguro.push({ groupName: grupoReal.name, options: opcoes });
+  }
+  total = Math.round(total * 100) / 100;
+  if (total <= 0) return res.status(400).json({ error: 'Total inválido' });
+
+  /* ── Gera PIX real via Mercado Pago (com o total CALCULADO no servidor) ── */
   let pixCode = null;
   let mpPaymentId = null;
 
@@ -209,18 +268,18 @@ app.post('/api/orders', async (req, res) => {
       const randomPart = Math.floor(Math.random() * 10000);
       const result  = await payment.create({
         body: {
-          transaction_amount: Number(total),
-          description:        `Pedido Açaí Trufado - ${productName}`,
+          transaction_amount: total,
+          description:        `Pedido Açaí Trufado - ${prod.name}`,
           payment_method_id:  'pix',
           payer: {
             email:          `cliente_${randomPart}@acaitrufado.com`,
-            first_name:     customerName.split(' ')[0] || 'Cliente',
-            last_name:      customerName.split(' ').slice(1).join(' ') || 'Cliente',
+            first_name:     nome.split(' ')[0] || 'Cliente',
+            last_name:      nome.split(' ').slice(1).join(' ') || 'Cliente',
             identification: { type: 'CPF', number: geraCPF() },
           },
           notification_url: 'https://acai-trufado-api.onrender.com/api/webhook/mercadopago',
         },
-        requestOptions: { idempotencyKey: `order_${customerPhone}_${Date.now()}` },
+        requestOptions: { idempotencyKey: `order_${fone}_${Date.now()}` },
       });
       pixCode     = result.point_of_interaction?.transaction_data?.qr_code ?? null;
       mpPaymentId = String(result.id ?? '');
@@ -230,15 +289,15 @@ app.post('/api/orders', async (req, res) => {
     }
   }
 
-  const { data, error } = await db()
+  const { data, error } = await supabase
     .from('orders')
     .insert({
-      customer_name:   customerName,
-      customer_phone:  customerPhone,
-      product_name:    productName,
-      summary:         summary ?? [],
+      customer_name:   nome,
+      customer_phone:  fone,
+      product_name:    prod.name,
+      summary:         summarySeguro,
       delivery_method: deliveryMethod,
-      total:           total ?? 0,
+      total,
       pix_code:        pixCode,
       mp_payment_id:   mpPaymentId,
       status:          'aguardando_pix',
@@ -319,34 +378,53 @@ app.patch('/api/orders/:id/status', requireAdmin, async (req, res) => {
   res.json(data);
 });
 
+// Tracking público pelo UUID do pedido (capability URL — o id é o "segredo").
+// Devolve apenas o necessário; NUNCA telefone, nome ou id de pagamento de terceiros.
 app.get('/api/orders/:id', async (req, res) => {
   const { data, error } = await db()
     .from('orders')
-    .select('*')
+    .select('id, status, product_name, summary, total, delivery_method, created_at, motoboy_lat, motoboy_lng, pix_code')
     .eq('id', req.params.id)
     .single();
   if (error) return res.status(404).json({ error: 'Pedido não encontrado' });
   res.json(data);
 });
 
-app.get('/api/orders/active/:userId', async (req, res) => {
-  const { userId } = req.params;
-  const { data, error } = await db()
-    .from('orders')
-    .select('*')
-    .eq('customer_phone', userId)
-    .not('status', 'in', '("entregue","cancelado")')
-    .order('created_at', { ascending: false })
-    .limit(1);
-
-  if (error) return res.status(500).json({ error: error.message });
-  res.json(data?.[0] ?? null);
-});
+// (Removido) GET /api/orders/active/:userId — expunha pedidos por telefone (IDOR enumerável).
+// O cliente agora rastreia apenas pelo UUID salvo localmente (acai_active_order).
 
 /* ════════════════════════════════════════════════════════════
    WEBHOOK MERCADO PAGO
 ════════════════════════════════════════════════════════════ */
+// Valida o header x-signature do Mercado Pago (evita webhook forjado / flood)
+function validaAssinaturaMP(req) {
+  const secret = process.env.MP_WEBHOOK_SECRET;
+  if (!secret) return null; // não configurado ainda → pula validação (com aviso)
+  try {
+    const sig   = req.headers['x-signature'];
+    const reqId = req.headers['x-request-id'];
+    const dataId = req.query['data.id'] || req.body?.data?.id;
+    if (!sig || !dataId) return false;
+    const parts = Object.fromEntries(sig.split(',').map(p => p.split('=').map(s => s.trim())));
+    if (!parts.ts || !parts.v1) return false;
+    const manifest = `id:${dataId};request-id:${reqId};ts:${parts.ts};`;
+    const hmac = crypto.createHmac('sha256', secret).update(manifest).digest('hex');
+    const a = Buffer.from(hmac), b = Buffer.from(parts.v1);
+    return a.length === b.length && crypto.timingSafeEqual(a, b);
+  } catch { return false; }
+}
+
 app.post('/api/webhook/mercadopago', async (req, res) => {
+  // Verifica assinatura ANTES de responder
+  const assinatura = validaAssinaturaMP(req);
+  if (assinatura === false) {
+    console.warn('⚠️ Webhook MP com assinatura inválida — ignorado');
+    return res.sendStatus(401);
+  }
+  if (assinatura === null) {
+    console.warn('⚠️ MP_WEBHOOK_SECRET não configurado — webhook aceito sem validar assinatura');
+  }
+
   res.sendStatus(200);
 
   const { type, data } = req.body;
@@ -458,5 +536,14 @@ app.put('/api/settings', requireAdmin, async (req, res) => {
 
 /* ── Health check ──────────────────────────────────────────── */
 app.get('/health', (_, res) => res.json({ ok: true }));
+
+/* ── Tratador de erro (ex.: origem bloqueada pelo CORS) ──────── */
+app.use((err, req, res, _next) => {
+  if (err && /CORS/i.test(err.message || '')) {
+    return res.status(403).json({ error: 'Origem não permitida' });
+  }
+  console.error('Erro não tratado:', err?.message ?? err);
+  res.status(500).json({ error: 'Erro interno' });
+});
 
 app.listen(PORT, () => console.log(`Servidor rodando na porta ${PORT}`));
