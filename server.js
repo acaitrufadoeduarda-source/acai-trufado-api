@@ -186,10 +186,15 @@ app.put('/api/products', requireAdmin, async (req, res) => {
     });
   }
 
-  // 1) Guarda os ids atuais para apagar SÓ depois que a inserção der certo
-  const { data: existing } = await supabase.from('products').select('id');
+  // 1) BACKUP completo dos produtos atuais (para restaurar se algo falhar)
+  const { data: backup } = await supabase.from('products').select('*');
 
-  // 2) Insere os novos PRIMEIRO (não destrói nada ainda)
+  // 2) Apaga os antigos PRIMEIRO — evita conflito de "nome único" ao reinserir
+  if (backup?.length) {
+    await supabase.from('products').delete().in('id', backup.map(b => b.id));
+  }
+
+  // 3) Insere os novos
   let { error } = await supabase.from('products').insert(montaRows(true));
 
   // Se falhar por causa da coluna price (ainda não criada), tenta sem ela
@@ -198,15 +203,14 @@ app.put('/api/products', requireAdmin, async (req, res) => {
     ({ error } = await supabase.from('products').insert(montaRows(false)));
   }
 
-  // 3) Se ainda assim falhou, ABORTA sem apagar nada (dados preservados)
+  // 4) Se falhou, RESTAURA o backup (não perde nada) e retorna erro
   if (error) {
-    console.error('Insert de produtos falhou — preservando os existentes:', error.message);
+    console.error('Insert de produtos falhou — restaurando backup:', error.message);
+    if (backup?.length) {
+      const restore = await supabase.from('products').insert(backup);
+      if (restore.error) console.error('FALHA AO RESTAURAR BACKUP:', restore.error.message);
+    }
     return res.status(500).json({ error: error.message });
-  }
-
-  // 4) Inserção OK → agora sim apaga os antigos
-  if (existing?.length) {
-    await supabase.from('products').delete().in('id', existing.map(e => e.id));
   }
 
   res.json({ ok: true });
