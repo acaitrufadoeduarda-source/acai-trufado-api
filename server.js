@@ -239,7 +239,7 @@ app.patch('/api/orders/:id/status', requireAdmin, async (req, res) => {
   const { id } = req.params;
   const { status, motoboy_lat, motoboy_lng } = req.body;
 
-  const VALID = ['pendente','pago','preparando','pronto','a_caminho','entregue','cancelado','aguardando_pix'];
+  const VALID = ['pendente','pago','preparando','pronto','a_caminho','motoboy_a_caminho','entregue','concluido','cancelado','aguardando_pix'];
   if (!VALID.includes(status))
     return res.status(400).json({ error: 'Status inválido' });
 
