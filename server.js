@@ -383,15 +383,17 @@ app.patch('/api/orders/:id/status', requireAdmin, async (req, res) => {
 });
 
 // Tracking público pelo UUID do pedido (capability URL — o id é o "segredo").
-// Devolve apenas o necessário; NUNCA telefone, nome ou id de pagamento de terceiros.
+// Usa select('*') para não quebrar se alguma coluna não existir, e REMOVE os
+// campos sensíveis no código (proteção IDOR — sem telefone/nome/id de pagamento).
 app.get('/api/orders/:id', async (req, res) => {
   const { data, error } = await db()
     .from('orders')
-    .select('id, status, product_name, summary, total, delivery_method, created_at, motoboy_lat, motoboy_lng, pix_code')
+    .select('*')
     .eq('id', req.params.id)
     .single();
-  if (error) return res.status(404).json({ error: 'Pedido não encontrado' });
-  res.json(data);
+  if (error || !data) return res.status(404).json({ error: 'Pedido não encontrado' });
+  const { customer_phone, customer_name, mp_payment_id, ...safe } = data;
+  res.json(safe);
 });
 
 // (Removido) GET /api/orders/active/:userId — expunha pedidos por telefone (IDOR enumerável).
