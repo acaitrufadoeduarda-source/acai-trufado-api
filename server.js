@@ -72,7 +72,7 @@ app.use('/api', apiLimiter);
 /* ── Auth helpers ──────────────────────────────────────────── */
 function generateToken() {
   const secret    = process.env.ADMIN_PASSWORD + '_acai_secret';
-  const expiresAt = Math.floor(Date.now() / 1000) + 60 * 60 * 12;
+  const expiresAt = Math.floor(Date.now() / 1000) + 60 * 60 * 24 * 365; // 1 ano (admin sempre logado)
   const hash      = crypto.createHmac('sha256', secret).update(String(expiresAt)).digest('hex');
   return `${hash}.${expiresAt}`;
 }
@@ -121,6 +121,26 @@ async function sendPushToUser(phone, status, orderId) {
     } catch (e) {
       if (e.statusCode === 410) {
         await supabase.from('push_subscriptions').delete().eq('user_id', phone);
+      }
+    }
+  }
+}
+
+// Notifica o(s) aparelho(s) do ADMIN (Eduarda) — inscritos com user_id = 'ADMIN'
+async function sendPushToAdmin(title, body, orderId) {
+  const supabase = db();
+  const { data: subs } = await supabase
+    .from('push_subscriptions')
+    .select('subscription')
+    .eq('user_id', 'ADMIN');
+  if (!subs?.length) return;
+  const payload = JSON.stringify({ title, body, orderId, url: '/admin.html' });
+  for (const row of subs) {
+    try {
+      await webpush.sendNotification(row.subscription, payload);
+    } catch (e) {
+      if (e.statusCode === 410) {
+        await supabase.from('push_subscriptions').delete().eq('user_id', 'ADMIN');
       }
     }
   }
@@ -447,7 +467,7 @@ app.post('/api/webhook/mercadopago', async (req, res) => {
 
     const { data: orders } = await supabase
       .from('orders')
-      .select('id, customer_phone')
+      .select('id, customer_phone, customer_name, product_name, total')
       .eq('mp_payment_id', paymentId)
       .limit(1);
 
@@ -460,7 +480,16 @@ app.post('/api/webhook/mercadopago', async (req, res) => {
       .update({ status: 'pago' })
       .eq('id', order.id);
 
+    // Notifica o cliente
     await sendPushToUser(order.customer_phone, 'pago', order.id);
+
+    // Notifica a Eduarda (admin) — pedido pago, hora de preparar
+    const valor = `R$ ${Number(order.total || 0).toFixed(2).replace('.', ',')}`;
+    await sendPushToAdmin(
+      '🛎️ Novo pedido pago!',
+      `${order.customer_name || 'Cliente'} — ${order.product_name || 'Açaí'} (${valor})`,
+      order.id
+    );
   } catch (e) {
     console.error('Webhook MP error:', e?.message ?? e);
   }
