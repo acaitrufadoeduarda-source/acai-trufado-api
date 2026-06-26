@@ -240,9 +240,19 @@ app.put('/api/products', requireAdmin, async (req, res) => {
    PEDIDOS
 ════════════════════════════════════════════════════════════ */
 app.post('/api/orders', orderLimiter, async (req, res) => {
-  const { customerName, customerPhone, productId, productName, summary, deliveryMethod } = req.body;
+  const { customerName, customerPhone, deliveryMethod } = req.body;
+  let { items } = req.body;
 
-  if (!customerName || !customerPhone || !deliveryMethod)
+  // Compatibilidade: cliente antigo manda 1 produto solto → vira um carrinho de 1 item
+  if (!Array.isArray(items) || !items.length) {
+    if (req.body.productId || req.body.productName) {
+      items = [{ productId: req.body.productId, productName: req.body.productName, summary: req.body.summary }];
+    } else {
+      items = [];
+    }
+  }
+
+  if (!customerName || !customerPhone || !deliveryMethod || !items.length)
     return res.status(400).json({ error: 'Dados incompletos' });
 
   // Sanitização básica dos campos livres
@@ -250,37 +260,50 @@ app.post('/api/orders', orderLimiter, async (req, res) => {
   const fone  = String(customerPhone).replace(/\D/g, '').slice(0, 15);
   if (!nome || fone.length < 10) return res.status(400).json({ error: 'Nome ou telefone inválido' });
 
-  /* ── Busca o produto REAL no banco e RECALCULA o total no servidor ──
-     Nunca confiamos no "total" enviado pelo cliente (evita manipulação de preço). */
+  /* ── Para CADA item do carrinho: busca o produto real e RECALCULA o subtotal no
+     servidor. Nunca confiamos em preço/total vindos do cliente. */
   const supabase = db();
-  let prod = null;
-  if (productId) {
-    ({ data: prod } = await supabase.from('products').select('name, price, groups, active').eq('id', productId).single());
-  }
-  // Fallback por nome (compatibilidade com clientes antigos)
-  if (!prod && productName) {
-    ({ data: prod } = await supabase.from('products').select('name, price, groups, active').eq('name', productName).limit(1).single());
-  }
-  if (!prod || prod.active === false)
-    return res.status(400).json({ error: 'Produto indisponível' });
+  let total = 0;
+  const potes = [];   // summary estruturado (1 entrada por pote)
+  const nomes = [];
 
-  let total = Number(prod.price) || 0;
-  const summarySeguro = [];
-  for (const g of (Array.isArray(summary) ? summary : [])) {
-    const grupoReal = (prod.groups || []).find(x => x.name === g.groupName);
-    if (!grupoReal) continue;
-    const opcoes = [];
-    for (const o of (g.options || [])) {
-      const optReal = (grupoReal.options || []).find(x => x.name === o.name);
-      if (!optReal) continue; // ignora opções inexistentes
-      const qty = Math.max(1, Math.min(99, parseInt(o.qty) || 1));
-      total += (Number(optReal.price) || 0) * qty;
-      opcoes.push({ name: optReal.name, qty, price: Number(optReal.price) || 0 });
+  for (const item of items.slice(0, 30)) {           // máx 30 potes por pedido
+    let prod = null;
+    if (item.productId) {
+      ({ data: prod } = await supabase.from('products').select('name, price, groups, active').eq('id', item.productId).single());
     }
-    if (opcoes.length) summarySeguro.push({ groupName: grupoReal.name, options: opcoes });
+    if (!prod && item.productName) {
+      ({ data: prod } = await supabase.from('products').select('name, price, groups, active').eq('name', item.productName).limit(1).single());
+    }
+    if (!prod || prod.active === false) continue;     // ignora item inválido/indisponível
+
+    let subtotal = Number(prod.price) || 0;
+    const grupos = [];
+    for (const g of (Array.isArray(item.summary) ? item.summary : [])) {
+      const grupoReal = (prod.groups || []).find(x => x.name === g.groupName);
+      if (!grupoReal) continue;
+      const opcoes = [];
+      for (const o of (g.options || [])) {
+        const optReal = (grupoReal.options || []).find(x => x.name === o.name);
+        if (!optReal) continue;
+        const qty = Math.max(1, Math.min(99, parseInt(o.qty) || 1));
+        subtotal += (Number(optReal.price) || 0) * qty;
+        opcoes.push({ name: optReal.name, qty, price: Number(optReal.price) || 0 });
+      }
+      if (opcoes.length) grupos.push({ groupName: grupoReal.name, options: opcoes });
+    }
+    subtotal = Math.round(subtotal * 100) / 100;
+    total += subtotal;
+    nomes.push(prod.name);
+    potes.push({ produto: prod.name, subtotal, grupos });
   }
+
   total = Math.round(total * 100) / 100;
-  if (total <= 0) return res.status(400).json({ error: 'Total inválido' });
+  if (!potes.length || total <= 0) return res.status(400).json({ error: 'Pedido inválido' });
+
+  const productNameResumo = nomes.length === 1
+    ? nomes[0]
+    : `${nomes.length} itens (${nomes.join(', ')})`.slice(0, 200);
 
   /* ── Gera PIX real via Mercado Pago (com o total CALCULADO no servidor) ── */
   let pixCode = null;
@@ -293,7 +316,7 @@ app.post('/api/orders', orderLimiter, async (req, res) => {
       const result  = await payment.create({
         body: {
           transaction_amount: total,
-          description:        `Pedido Açaí Trufado - ${prod.name}`,
+          description:        `Pedido Açaí Trufado - ${nomes.length} item(ns)`,
           payment_method_id:  'pix',
           payer: {
             email:          `cliente_${randomPart}@acaitrufado.com`,
@@ -318,8 +341,8 @@ app.post('/api/orders', orderLimiter, async (req, res) => {
     .insert({
       customer_name:   nome,
       customer_phone:  fone,
-      product_name:    prod.name,
-      summary:         summarySeguro,
+      product_name:    productNameResumo,
+      summary:         potes,
       delivery_method: deliveryMethod,
       total,
       pix_code:        pixCode,
