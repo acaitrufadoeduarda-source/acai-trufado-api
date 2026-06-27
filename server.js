@@ -240,8 +240,11 @@ app.put('/api/products', requireAdmin, async (req, res) => {
    PEDIDOS
 ════════════════════════════════════════════════════════════ */
 app.post('/api/orders', orderLimiter, async (req, res) => {
-  const { customerName, customerPhone, deliveryMethod } = req.body;
+  const { customerName, customerPhone, deliveryMethod, paymentMethod } = req.body;
   let { items } = req.body;
+
+  // Dinheiro só é permitido na RETIRADA. Motoboy é sempre PIX.
+  const isCash = paymentMethod === 'dinheiro' && deliveryMethod === 'retirada';
 
   // Compatibilidade: cliente antigo manda 1 produto solto → vira um carrinho de 1 item
   if (!Array.isArray(items) || !items.length) {
@@ -305,11 +308,12 @@ app.post('/api/orders', orderLimiter, async (req, res) => {
     ? nomes[0]
     : `${nomes.length} itens (${nomes.join(', ')})`.slice(0, 200);
 
-  /* ── Gera PIX real via Mercado Pago (com o total CALCULADO no servidor) ── */
+  /* ── Gera PIX real via Mercado Pago (com o total CALCULADO no servidor) ──
+     Pedidos em DINHEIRO (retirada) pulam o PIX e já entram confirmados. */
   let pixCode = null;
   let mpPaymentId = null;
 
-  if (process.env.MP_ACCESS_TOKEN) {
+  if (!isCash && process.env.MP_ACCESS_TOKEN) {
     try {
       const payment = new Payment(mpClient());
       const randomPart = Math.floor(Math.random() * 10000);
@@ -347,7 +351,8 @@ app.post('/api/orders', orderLimiter, async (req, res) => {
       total,
       pix_code:        pixCode,
       mp_payment_id:   mpPaymentId,
-      status:          'aguardando_pix',
+      payment_method:  isCash ? 'dinheiro' : 'pix',
+      status:          isCash ? 'pago' : 'aguardando_pix',
     })
     .select()
     .single();
@@ -356,6 +361,14 @@ app.post('/api/orders', orderLimiter, async (req, res) => {
     console.error('❌ Supabase insert error:', JSON.stringify(error));
     return res.status(500).json({ error: error.message });
   }
+
+  // Dinheiro: não há webhook de pagamento — notifica a admin imediatamente
+  if (isCash) {
+    try {
+      await sendPushToAdmin('🛎️ Novo pedido (Dinheiro)', `${nome} · R$ ${total.toFixed(2)} · retirada`, data.id);
+    } catch (e) { console.error('push admin (cash):', e?.message ?? e); }
+  }
+
   res.status(201).json({ ...data, pixCode });
 });
 
